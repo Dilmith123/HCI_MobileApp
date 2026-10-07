@@ -10,6 +10,7 @@ create table if not exists public.profiles (
   id          uuid references auth.users(id) on delete cascade primary key,
   full_name   text,
   phone       text,
+  address     text,
   avatar_url  text,
   created_at  timestamptz default now() not null
 );
@@ -18,11 +19,13 @@ create table if not exists public.profiles (
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer as $$
 begin
-  insert into public.profiles (id, full_name, phone)
+  insert into public.profiles (id, full_name, phone, address, avatar_url)
   values (
     new.id,
     coalesce(new.raw_user_meta_data ->> 'full_name', ''),
-    coalesce(new.raw_user_meta_data ->> 'phone', '')
+    coalesce(new.raw_user_meta_data ->> 'phone', ''),
+    coalesce(new.raw_user_meta_data ->> 'address', ''),
+    coalesce(new.raw_user_meta_data ->> 'avatar_url', null)
   )
   on conflict (id) do nothing;
   return new;
@@ -37,11 +40,19 @@ create trigger on_auth_user_created
 -- RLS
 alter table public.profiles enable row level security;
 
-create policy "Users can view all profiles"
-  on public.profiles for select using (true);
+-- Users can only view their own profile for privacy
+create policy "Users can view own profile"
+  on public.profiles for select using (auth.uid() = id);
 
+-- Users can insert their own profile
+create policy "Users can insert own profile"
+  on public.profiles for insert with check (auth.uid() = id);
+
+-- Users can update only their own profile
 create policy "Users can update own profile"
-  on public.profiles for update using (auth.uid() = id);
+  on public.profiles for update
+  using (auth.uid() = id)
+  with check (auth.uid() = id);
 
 -- ── Pet Reports ───────────────────────────────────────────────
 
@@ -117,3 +128,34 @@ create policy "Users can delete own pet images"
     bucket_id = 'pet-images'
     and auth.uid()::text = (storage.foldername(name))[1]
   );
+
+-- Avatars bucket
+insert into storage.buckets (id, name, public)
+values ('avatars', 'avatars', true)
+on conflict (id) do nothing;
+
+create policy "Public read access for avatars"
+  on storage.objects for select
+  using (bucket_id = 'avatars');
+
+create policy "Authenticated users can upload avatars"
+  on storage.objects for insert
+  with check (
+    bucket_id = 'avatars'
+    and auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+create policy "Users can update own avatar"
+  on storage.objects for update
+  using (
+    bucket_id = 'avatars'
+    and auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+create policy "Users can delete own avatar"
+  on storage.objects for delete
+  using (
+    bucket_id = 'avatars'
+    and auth.uid()::text = (storage.foldername(name))[1]
+  );
+

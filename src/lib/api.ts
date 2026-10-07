@@ -6,7 +6,13 @@
  * the app keeps working with static fallback data in preview mode.
  */
 import { supabase } from './supabase';
-import type { NewReport, PetReport, ReportFilters } from '../types/database';
+import type {
+  NewReport,
+  PetReport,
+  Profile,
+  ReportFilters,
+  UpdateProfile,
+} from '../types/database';
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -29,7 +35,7 @@ export async function signIn(email: string, password: string) {
 export async function signUp(
   email: string,
   password: string,
-  meta: { full_name?: string; phone?: string },
+  meta: { full_name?: string; phone?: string; address?: string; avatar_url?: string },
 ) {
   if (!supabase) throw new Error('Supabase is not configured.');
   const { data, error } = await supabase.auth.signUp({
@@ -38,7 +44,7 @@ export async function signUp(
     options: { data: meta },
   });
   if (error) throw error;
-  return data.user;
+  return { user: data.user, session: data.session };
 }
 
 /** Sign out the current user. */
@@ -64,20 +70,62 @@ export async function resetPassword(email: string): Promise<void> {
   if (error) throw error;
 }
 
+// ── Profiles ──────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the profile belonging to the given user ID.
+ * Returns null if Supabase is not configured or profile not found.
+ */
+export async function fetchProfile(userId: string): Promise<Profile | null> {
+  if (!supabase || !userId) return null;
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+/**
+ * Update the user's profile in public.profiles.
+ * Validates that the active session matches userId for defense-in-depth.
+ */
+export async function updateProfile(
+  userId: string,
+  updates: UpdateProfile,
+): Promise<Profile> {
+  if (!supabase) throw new Error('Supabase is not configured.');
+  if (!userId) throw new Error('User ID is required.');
+
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const activeUserId = session?.user?.id ?? null;
+  if (!activeUserId || activeUserId !== userId) {
+    throw new Error('Session mismatch. You can only edit your own profile.');
+  }
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .update(updates)
+    .eq('id', userId)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
 // ── Pet Reports ───────────────────────────────────────────────────────────────
 
 /**
- * Escape a value for safe use inside a Supabase PostgREST filter string.
- *
- * PostgREST `.or()` and `.ilike()` filter DSLs accept raw operator strings
- * such as `name.ilike.x` where `x` is the pattern.  Special characters
- * inside the pattern (`,` `:` `(` `)` `*`) change the meaning of the filter
- * and can be abused to alter the query, so they must be percent-encoded
- * by the caller.  This mirrors what the official Supabase client libraries
- * document for "unsafe" values in filter expressions.
+ * Sanitize a search query for safe use inside PostgREST .or() filter strings.
+ * Removes PostgREST DSL delimiters (commas, parentheses, quotes) while preserving
+ * characters for case-insensitive partial matching with ILIKE.
  */
-function escapePostgrestValue(raw: string): string {
-  return encodeURIComponent(raw);
+function sanitizeSearchQuery(raw: string): string {
+  return raw.trim().replace(/\s+/g, ' ').replace(/[,()"']/g, '');
 }
 
 /**
@@ -101,11 +149,14 @@ export async function fetchReports(filters?: ReportFilters): Promise<PetReport[]
   if (filters?.district && filters.district !== 'All') {
     q = q.eq('district', filters.district);
   }
-  if (filters?.query && filters.query.trim()) {
-    const term = escapePostgrestValue(`%${filters.query.trim()}%`);
-    q = q.or(
-      `name.ilike.${term},location.ilike.${term},species.ilike.${term},district.ilike.${term}`,
-    );
+  if (filters?.query) {
+    const clean = sanitizeSearchQuery(filters.query);
+    if (clean) {
+      const term = `%${clean}%`;
+      q = q.or(
+        `name.ilike.${term},location.ilike.${term},species.ilike.${term},district.ilike.${term}`,
+      );
+    }
   }
 
   const { data, error } = await q;
@@ -186,6 +237,34 @@ export async function deleteReport(id: string): Promise<void> {
   if (error) throw error;
 }
 
+/**
+ * Update mutable fields of an existing report (owner only — enforced by RLS).
+ * Does NOT allow changing id, user_id, or created_at.
+ */
+export async function updateReport(
+  id: string,
+  updates: Partial<Pick<PetReport, 'name' | 'species' | 'location' | 'district' | 'contact' | 'description' | 'image_url' | 'status'>>,
+): Promise<PetReport> {
+  if (!supabase) throw new Error('Supabase is not configured.');
+  if (!id) throw new Error('Report ID is required.');
+
+  // Defense-in-depth: ensure the caller is authenticated before hitting RLS.
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  if (!session?.user?.id) throw new Error('You must be signed in to edit a report.');
+
+  const { data, error } = await supabase
+    .from('pet_reports')
+    .update(updates)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
 // ── Storage ───────────────────────────────────────────────────────────────────
 
 // Whitelist of image file extensions users are allowed to upload.  Used to
@@ -246,6 +325,62 @@ export async function uploadPetImage(
   const {
     data: { publicUrl },
   } = supabase.storage.from('pet-images').getPublicUrl(path);
+
+  return publicUrl;
+}
+
+/**
+ * Upload an avatar/profile image to the `avatars` storage bucket (with fallback to `pet-images`)
+ * and return its public URL.
+ *
+ * Path: `{userId}/{timestamp}.{safeExt}`
+ */
+export async function uploadAvatar(
+  file: File,
+  userId: string,
+): Promise<string | null> {
+  if (!supabase) return null;
+
+  if (!userId) throw new Error('Authenticated user id is required to upload an avatar.');
+  if (!file || file.size === 0) throw new Error('Empty file provided.');
+  if (file.size > MAX_IMAGE_BYTES) {
+    throw new Error(`Avatar image too large. Maximum size is ${MAX_IMAGE_BYTES / 1024 / 1024} MB.`);
+  }
+
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const activeUserId = session?.user?.id ?? null;
+  if (!activeUserId || activeUserId !== userId) {
+    throw new Error('Session mismatch. Please sign in again and retry.');
+  }
+
+  const rawExt = (file.name.split('.').pop() ?? 'jpg').toLowerCase();
+  const ext = ALLOWED_IMAGE_EXT.includes(rawExt as (typeof ALLOWED_IMAGE_EXT)[number])
+    ? rawExt
+    : 'jpg';
+
+  const path = `${userId}/${Date.now()}.${ext}`;
+
+  // Try uploading to 'avatars' bucket, fallback to 'pet-images' if 'avatars' not yet created
+  let bucket = 'avatars';
+  let { error: uploadError } = await supabase.storage
+    .from(bucket)
+    .upload(path, file, { upsert: false, contentType: file.type || undefined });
+
+  if (uploadError && (uploadError.message?.toLowerCase().includes('not found') || uploadError.message?.toLowerCase().includes('bucket'))) {
+    bucket = 'pet-images';
+    const retry = await supabase.storage
+      .from(bucket)
+      .upload(path, file, { upsert: false, contentType: file.type || undefined });
+    uploadError = retry.error;
+  }
+
+  if (uploadError) throw uploadError;
+
+  const {
+    data: { publicUrl },
+  } = supabase.storage.from(bucket).getPublicUrl(path);
 
   return publicUrl;
 }

@@ -18,6 +18,7 @@ export type Profile = {
   id: string;
   full_name: string | null;
   phone: string | null;
+  address: string | null;
   avatar_url: string | null;
   created_at: string;
 };
@@ -26,6 +27,7 @@ export type Profile = {
 
 export type NewReport = Omit<PetReport, 'id' | 'created_at'>;
 export type UpdateReport = Partial<Omit<PetReport, 'id' | 'user_id' | 'created_at'>>;
+export type UpdateProfile = Partial<Omit<Profile, 'id' | 'created_at'>>;
 
 // ── Search filter shape ───────────────────────────────────────────────────────
 

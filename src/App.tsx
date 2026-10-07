@@ -9,17 +9,22 @@ import {
 import {
   ArrowLeft,
   Camera,
+  CheckCircle,
   ChevronDown,
   Eye,
   EyeOff,
+  FileText,
   Home,
   Loader2,
   LogOut,
   LockKeyhole,
   Mail,
   MapPin,
+  MessageCircle,
   PawPrint,
+  Pencil,
   Phone,
+  PhoneCall,
   PlusCircle,
   Search,
   SlidersHorizontal,
@@ -37,10 +42,14 @@ import {
   fetchMyReports,
   submitReport,
   uploadPetImage,
+  uploadAvatar,
   updateReportStatus,
+  updateReport,
   deleteReport,
+  fetchProfile,
+  updateProfile,
 } from '@/lib/api';
-import type { PetReport, NewReport, ReportFilters } from '@/types/database';
+import type { PetReport, NewReport, Profile, ReportFilters } from '@/types/database';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -96,6 +105,30 @@ function useDebounce<T>(value: T, ms = 350): T {
   return debounced;
 }
 
+/**
+ * Normalise a phone number string for use in WhatsApp wa.me links.
+ *
+ * Rules applied in order:
+ *  1. Strip all whitespace, hyphens, parentheses, and dots.
+ *  2. Remove a leading `+` (wa.me does not use it).
+ *  3. For Sri Lankan mobile numbers that start with `07` (local format),
+ *     replace the leading `0` with `94` (country code).
+ *  4. Return the resulting digit-only international string, or null if
+ *     the input is empty / too short to be a real number.
+ */
+function normalizePhone(raw: string): string | null {
+  if (!raw || !raw.trim()) return null;
+  // Strip formatting characters
+  let n = raw.replace(/[\s\-().+]/g, '');
+  // Sri Lankan local format: 07xxxxxxxx → 947xxxxxxxx
+  if (n.startsWith('0') && n.length >= 9) {
+    n = '94' + n.slice(1);
+  }
+  // Must be at least 7 digits to be meaningful
+  if (!/^\d{7,}$/.test(n)) return null;
+  return n;
+}
+
 // ── Shared UI ─────────────────────────────────────────────────────────────────
 
 type FieldProps = {
@@ -125,7 +158,11 @@ function Field({ icon: Icon, type = 'text', placeholder, value, onChange, right 
 function Brand({ compact = false }: { compact?: boolean }) {
   return (
     <div className={`brand ${compact ? 'brand-compact' : ''}`}>
-      <PawPrint className="brand-paw" size={compact ? 74 : 78} strokeWidth={2.1} />
+      <img
+        src="/images/pawlo-logo.png"
+        alt="PAWLo Logo"
+        className="brand-paw-img"
+      />
       <div className="brand-name">PAWLO</div>
     </div>
   );
@@ -164,9 +201,16 @@ function Spinner() {
   );
 }
 
-function ReportCard({ report }: { report: PetReport }) {
+function ReportCard({ report, onClick }: { report: PetReport; onClick?: () => void }) {
   return (
-    <article className="report-card">
+    <article
+      className={`report-card${onClick ? ' report-card-clickable' : ''}`}
+      onClick={onClick}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={onClick ? (e) => e.key === 'Enter' && onClick() : undefined}
+      aria-label={onClick ? `View details for ${report.name}` : undefined}
+    >
       <img
         src={report.image_url ?? 'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg?auto=compress&cs=tinysrgb&h=200&w=200'}
         alt={`${report.name} the ${report.species}`}
@@ -175,7 +219,7 @@ function ReportCard({ report }: { report: PetReport }) {
         <strong>{report.name}</strong>
         <span>{report.location}</span>
         <span>{fmtDate(report.created_at)}</span>
-        <b className={report.status === 'FOUND' ? 'badge-found' : ''}>{report.status}</b>
+        <b className={report.status === 'FOUND' ? 'badge-found' : 'badge-lost'}>{report.status}</b>
       </div>
     </article>
   );
@@ -188,6 +232,7 @@ function HomeScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
   const [reports, setReports] = useState<PetReport[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [selectedReport, setSelectedReport] = useState<PetReport | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -211,6 +256,17 @@ function HomeScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
 
   const handleTabChange = (t: Tab) => { setActiveTab(t); onTabChange(t); };
 
+  // If a report is selected, show the public detail screen
+  if (selectedReport) {
+    return (
+      <PublicReportDetailScreen
+        report={selectedReport}
+        onBack={() => setSelectedReport(null)}
+        onTabChange={handleTabChange}
+      />
+    );
+  }
+
   return (
     <main className="app-shell home-screen">
       <header className="home-header">PAWLO</header>
@@ -219,10 +275,142 @@ function HomeScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
         <Spinner />
       ) : (
         <section className="report-grid" aria-label="Lost pet reports">
-          {reports.map((r) => <ReportCard key={r.id} report={r} />)}
+          {reports.map((r) => (
+            <ReportCard
+              key={r.id}
+              report={r}
+              onClick={() => setSelectedReport(r)}
+            />
+          ))}
         </section>
       )}
       <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
+    </main>
+  );
+}
+
+// ── Public Report Detail Screen ───────────────────────────────────────────────
+// View-only. No Edit / Delete / Mark-as-Found.
+// Call and WhatsApp buttons use the report's contact field.
+
+type PublicReportDetailProps = {
+  report: PetReport;
+  onBack: () => void;
+  onTabChange: (t: Tab) => void;
+  activeTab?: Tab;
+};
+
+function PublicReportDetailScreen({
+  report,
+  onBack,
+  onTabChange,
+  activeTab = 'Home',
+}: PublicReportDetailProps) {
+  const isLost = report.status === 'LOST';
+  const PLACEHOLDER = 'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg?auto=compress&cs=tinysrgb&h=650&w=940';
+
+  // Normalised number for wa.me and tel: links
+  const phoneNorm = normalizePhone(report.contact ?? '');
+  const hasContact = !!phoneNorm;
+
+  const handleCall = () => {
+    if (!hasContact) return;
+    window.open(`tel:${report.contact!.trim()}`, '_self');
+  };
+
+  const handleWhatsApp = () => {
+    if (!hasContact) return;
+    window.open(`https://wa.me/${phoneNorm}`, '_blank', 'noopener,noreferrer');
+  };
+
+  return (
+    <main className="app-shell detail-screen">
+      {/* Top bar */}
+      <div className="detail-topbar">
+        <button className="back-button" onClick={onBack} aria-label="Go back">
+          <ArrowLeft size={21} />
+        </button>
+        <span className="detail-topbar-title">PAWLO</span>
+      </div>
+
+      {/* Hero image */}
+      <div className="detail-hero-wrap">
+        <img
+          src={report.image_url ?? PLACEHOLDER}
+          alt={`${report.name} the ${report.species}`}
+          className="detail-hero-img"
+        />
+      </div>
+
+      {/* Name + badge */}
+      <div className="detail-name-row">
+        <h1 className="detail-pet-name">{report.name}</h1>
+        <span className={`detail-status-badge ${isLost ? 'badge-lost' : 'badge-found'}`}>
+          {report.status}
+        </span>
+      </div>
+
+      {/* Location */}
+      <div className="detail-location-row">
+        <MapPin size={14} strokeWidth={2.2} className="detail-loc-icon" />
+        <span className="detail-location-text">
+          {report.district ? `${report.location}, ${report.district}` : report.location}
+        </span>
+      </div>
+
+      {/* Info block */}
+      <div className="detail-info-block">
+        <div className="detail-info-row">
+          <span className="detail-info-label">Species:</span>
+          <span className="detail-info-val">{report.species}</span>
+        </div>
+        <div className="detail-info-row">
+          <span className="detail-info-label">Date Reported:</span>
+          <span className="detail-info-val">{fmtDate(report.created_at)}</span>
+        </div>
+        {report.contact && (
+          <div className="detail-info-row">
+            <span className="detail-info-label">Contact:</span>
+            <span className="detail-info-val">{report.contact}</span>
+          </div>
+        )}
+        {report.description && (
+          <div className="detail-info-row detail-info-desc">
+            <span className="detail-info-label">Description:</span>
+            <span className="detail-info-val detail-desc-text">{report.description}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Call + WhatsApp action buttons */}
+      <div className="pub-detail-actions">
+        <button
+          className={`pub-detail-btn pub-detail-call${!hasContact ? ' pub-detail-btn-disabled' : ''}`}
+          onClick={handleCall}
+          disabled={!hasContact}
+          aria-label={hasContact ? `Call ${report.contact}` : 'No contact number available'}
+          title={hasContact ? `Call ${report.contact}` : 'No contact number'}
+        >
+          <PhoneCall size={17} strokeWidth={2.3} />
+          Call
+        </button>
+        <button
+          className={`pub-detail-btn pub-detail-whatsapp${!hasContact ? ' pub-detail-btn-disabled' : ''}`}
+          onClick={handleWhatsApp}
+          disabled={!hasContact}
+          aria-label={hasContact ? `WhatsApp ${report.contact}` : 'No contact number available'}
+          title={hasContact ? `WhatsApp ${report.contact}` : 'No contact number'}
+        >
+          <MessageCircle size={17} strokeWidth={2.3} />
+          Whatsapp
+        </button>
+      </div>
+
+      {!hasContact && (
+        <p className="pub-detail-no-contact">No contact number provided for this report.</p>
+      )}
+
+      <BottomNav activeTab={activeTab} onTabChange={onTabChange} />
     </main>
   );
 }
@@ -237,13 +425,15 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
   const [districtFilter, setDistrictFilter] = useState('All');
   const [results, setResults] = useState<PetReport[]>([]);
   const [loading, setLoading] = useState(true);
+  const [selectedReport, setSelectedReport] = useState<PetReport | null>(null);
 
   const debouncedQuery = useDebounce(query, 400);
 
   const loadResults = useCallback(async () => {
     setLoading(true);
+    const cleanedQuery = debouncedQuery.trim().replace(/\s+/g, ' ');
     const filters: ReportFilters = {
-      query: debouncedQuery,
+      query: cleanedQuery,
       species: speciesFilter,
       status: statusFilter,
       district: districtFilter,
@@ -251,7 +441,7 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
 
     if (!supabase) {
       // Client-side filter on static data
-      const q = debouncedQuery.toLowerCase();
+      const q = cleanedQuery.toLowerCase();
       const filtered = STATIC_REPORTS.filter((r) => {
         const mQ = !q || r.name.toLowerCase().includes(q) || r.location.toLowerCase().includes(q) || r.species.toLowerCase().includes(q);
         const mSp = speciesFilter === 'All' || r.species === speciesFilter;
@@ -278,6 +468,18 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
 
   const handleTabChange = (t: Tab) => { setActiveTab(t); onTabChange(t); };
 
+  // If a report is selected, display the public detail screen (with Search highlighted on BottomNav)
+  if (selectedReport) {
+    return (
+      <PublicReportDetailScreen
+        report={selectedReport}
+        onBack={() => setSelectedReport(null)}
+        onTabChange={handleTabChange}
+        activeTab="Search"
+      />
+    );
+  }
+
   return (
     <main className="app-shell search-screen">
       {/* Search Bar */}
@@ -300,7 +502,7 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
       <div className="filter-row">
         {[
           { value: speciesFilter, setter: setSpeciesFilter, opts: ['Species', 'Cat', 'Dog', 'Bird', 'Other'] },
-          { value: statusFilter,  setter: setStatusFilter,  opts: ['Status', 'LOST', 'FOUND'] },
+          { value: statusFilter, setter: setStatusFilter, opts: ['Status', 'LOST', 'FOUND'] },
           { value: districtFilter, setter: setDistrictFilter, opts: ['District', 'Kandy', 'Colombo', 'Gampaha', 'Matara', 'Galle', 'Kurunegala', 'Ratnapura', 'Anuradhapura', 'Trincomalee', 'Jaffna', 'Other'] },
         ].map(({ value, setter, opts }) => (
           <label key={opts[0]} className="filter-select-wrap">
@@ -322,7 +524,20 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
           <p className="search-empty">No reports match your search.</p>
         ) : (
           results.map((r) => (
-            <article className="search-card" key={r.id}>
+            <article
+              className="search-card report-card-clickable"
+              key={r.id}
+              onClick={() => setSelectedReport(r)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setSelectedReport(r);
+                }
+              }}
+              aria-label={`View details for ${r.name}`}
+            >
               <img
                 src={r.image_url ?? 'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg?auto=compress&cs=tinysrgb&h=200&w=200'}
                 alt={`${r.name} the ${r.species}`}
@@ -350,9 +565,13 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
 
 // ── Report Screen ─────────────────────────────────────────────────────────────
 
-type ReportScreenProps = { onTabChange: (t: Tab) => void; userId: string | null };
+type ReportScreenProps = {
+  onTabChange: (t: Tab) => void;
+  userId: string | null;
+  userPhone?: string | null;
+};
 
-function ReportScreen({ onTabChange, userId }: ReportScreenProps) {
+function ReportScreen({ onTabChange, userId, userPhone }: ReportScreenProps) {
   const [activeTab, setActiveTab] = useState<Tab>('Report');
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
@@ -360,12 +579,19 @@ function ReportScreen({ onTabChange, userId }: ReportScreenProps) {
   const [species, setSpecies] = useState('');
   const [location, setLocation] = useState('');
   const [district, setDistrict] = useState('');
-  const [contact, setContact] = useState('');
+  const [contact, setContact] = useState(userPhone ?? '');
   const [description, setDescription] = useState('');
   const [submitted, setSubmitted] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // If the user's profile has a phone number, pre-fill contact when available
+  useEffect(() => {
+    if (userPhone && !contact) {
+      setContact(userPhone);
+    }
+  }, [userPhone]);
 
   const handleTabChange = (t: Tab) => { setActiveTab(t); onTabChange(t); };
 
@@ -456,7 +682,7 @@ function ReportScreen({ onTabChange, userId }: ReportScreenProps) {
     setSpecies('');
     setLocation('');
     setDistrict('');
-    setContact('');
+    setContact(userPhone ?? '');
     setDescription('');
     setSubmitted(false);
     setErrorMsg('');
@@ -546,12 +772,329 @@ function ReportScreen({ onTabChange, userId }: ReportScreenProps) {
   );
 }
 
+// ── Report Detail Screen ───────────────────────────────────────────────────────
+
+type ReportDetailProps = {
+  report: PetReport;
+  onBack: () => void;
+  onTabChange: (t: Tab) => void;
+  onMarkFound: (id: string) => void;
+  onDelete: (id: string) => void;
+  onEdit: (report: PetReport) => void;
+  userId: string | null;
+};
+
+function ReportDetailScreen({
+  report,
+  onBack,
+  onTabChange,
+  onMarkFound,
+  onDelete,
+  onEdit,
+  userId,
+}: ReportDetailProps) {
+  const isOwner = !!userId && userId === report.user_id;
+  const isLost = report.status === 'LOST';
+
+  return (
+    <main className="app-shell detail-screen">
+      {/* Top bar */}
+      <div className="detail-topbar">
+        <button className="back-button" onClick={onBack} aria-label="Go back">
+          <ArrowLeft size={21} />
+        </button>
+        <span className="detail-topbar-title">PAWLO</span>
+      </div>
+
+      {/* Hero image */}
+      <div className="detail-hero-wrap">
+        <img
+          src={
+            report.image_url ??
+            'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg?auto=compress&cs=tinysrgb&h=650&w=940'
+          }
+          alt={`${report.name} the ${report.species}`}
+          className="detail-hero-img"
+        />
+      </div>
+
+      {/* Name + badge */}
+      <div className="detail-name-row">
+        <h1 className="detail-pet-name">{report.name}</h1>
+        <span className={`detail-status-badge ${isLost ? 'badge-lost' : 'badge-found'}`}>
+          {report.status}
+        </span>
+      </div>
+
+      {/* Location row */}
+      <div className="detail-location-row">
+        <MapPin size={14} strokeWidth={2.2} className="detail-loc-icon" />
+        <span className="detail-location-text">
+          {report.district ? `${report.location}, ${report.district}` : report.location}
+        </span>
+      </div>
+
+      {/* Info block */}
+      <div className="detail-info-block">
+        <div className="detail-info-row">
+          <span className="detail-info-label">Species:</span>
+          <span className="detail-info-val">{report.species}</span>
+        </div>
+        <div className="detail-info-row">
+          <span className="detail-info-label">Contact:</span>
+          <span className="detail-info-val">{report.contact || '—'}</span>
+        </div>
+        <div className="detail-info-row">
+          <span className="detail-info-label">Date Reported:</span>
+          <span className="detail-info-val">{fmtDate(report.created_at)}</span>
+        </div>
+        {report.description && (
+          <div className="detail-info-row detail-info-desc">
+            <span className="detail-info-label">Description:</span>
+            <span className="detail-info-val detail-desc-text">{report.description}</span>
+          </div>
+        )}
+      </div>
+
+      {/* Action buttons — only for owner */}
+      {isOwner && (
+        <div className="detail-actions">
+          {isLost && (
+            <button
+              className="detail-btn detail-btn-found"
+              onClick={() => onMarkFound(report.id)}
+            >
+              <CheckCircle size={16} strokeWidth={2.2} />
+              Mark as Found
+            </button>
+          )}
+          <div className="detail-btn-row">
+            <button
+              className="detail-btn detail-btn-edit"
+              onClick={() => onEdit(report)}
+            >
+              <Pencil size={15} strokeWidth={2.2} />
+              Edit
+            </button>
+            <button
+              className="detail-btn detail-btn-delete"
+              onClick={() => onDelete(report.id)}
+            >
+              <Trash2 size={15} strokeWidth={2.2} />
+              Delete
+            </button>
+          </div>
+        </div>
+      )}
+
+      <BottomNav activeTab="My Reports" onTabChange={onTabChange} />
+    </main>
+  );
+}
+
+// ── Edit Report Screen ─────────────────────────────────────────────────────────
+
+type EditReportScreenProps = {
+  report: PetReport;
+  onBack: () => void;
+  onTabChange: (t: Tab) => void;
+  onSaved: (updated: PetReport) => void;
+  userId: string | null;
+};
+
+function EditReportScreen({ report, onBack, onTabChange, onSaved, userId }: EditReportScreenProps) {
+  const [petName, setPetName] = useState(report.name);
+  const [species, setSpecies] = useState(report.species);
+  const [location, setLocation] = useState(report.location);
+  const [district, setDistrict] = useState(report.district);
+  const [contact, setContact] = useState(report.contact);
+  const [description, setDescription] = useState(report.description ?? '');
+  const [photoFile, setPhotoFile] = useState<File | null>(null);
+  const [photoPreview, setPhotoPreview] = useState<string | null>(report.image_url ?? null);
+  const [saving, setSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const handlePhoto = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPhotoFile(file);
+    const reader = new FileReader();
+    reader.onload = () => setPhotoPreview(reader.result as string);
+    reader.readAsDataURL(file);
+  };
+
+  const handleSave = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setErrorMsg('');
+
+    const validation =
+      requiredError('Pet Name', petName) ??
+      requiredError('Species', species) ??
+      requiredError('Location', location) ??
+      requiredError('District', district) ??
+      requiredError('Contact Number', contact) ??
+      (isValidPhone(contact) ? null : 'Please enter a valid phone number (at least 8 digits).');
+    if (validation) { setErrorMsg(validation); return; }
+
+    if (!userId) { setErrorMsg('You must be logged in to edit a report.'); return; }
+    if (photoFile && photoFile.size > 10 * 1024 * 1024) {
+      setErrorMsg('Photo is too large. Maximum size is 10 MB.');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      let imageUrl = report.image_url;
+      if (photoFile) {
+        const session = await getSession();
+        const activeUserId = session?.user?.id ?? null;
+        if (!activeUserId || activeUserId !== userId) {
+          throw new Error('Session mismatch. Please log in again and retry.');
+        }
+        const uploaded = await uploadPetImage(photoFile, activeUserId);
+        if (uploaded) imageUrl = uploaded;
+      }
+
+      const updated = await updateReport(report.id, {
+        name: petName.trim(),
+        species: species.trim(),
+        location: location.trim(),
+        district: district.trim(),
+        contact: contact.trim(),
+        description: description.trim() || null,
+        image_url: imageUrl,
+      });
+      onSaved(updated);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save changes.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <main className="app-shell report-screen">
+      <div className="report-topbar">
+        <button className="back-button" onClick={onBack} aria-label="Go back">
+          <ArrowLeft size={21} />
+        </button>
+        <h1 className="report-title">Edit Report</h1>
+      </div>
+
+      <form className="report-form" onSubmit={handleSave}>
+        {/* Photo Upload */}
+        <button
+          type="button"
+          className="photo-upload-area"
+          onClick={() => fileRef.current?.click()}
+          aria-label="Change pet photo"
+        >
+          {photoPreview ? (
+            <img src={photoPreview} alt="Pet preview" className="photo-preview" />
+          ) : (
+            <>
+              <Camera size={34} strokeWidth={1.5} className="photo-upload-icon" />
+              <span>Add Photo</span>
+            </>
+          )}
+        </button>
+        <input ref={fileRef} type="file" accept="image/*" hidden onChange={handlePhoto} />
+
+        <input
+          className="report-input"
+          type="text"
+          placeholder="Pet Name"
+          value={petName}
+          onChange={(e) => setPetName(e.target.value)}
+          required
+        />
+
+        <div className="report-select-wrap">
+          <select
+            className="report-select"
+            value={species}
+            onChange={(e) => setSpecies(e.target.value)}
+            required
+          >
+            <option value="" disabled>Species (dog, cat, bird, other)</option>
+            <option value="Dog">Dog</option>
+            <option value="Cat">Cat</option>
+            <option value="Bird">Bird</option>
+            <option value="Other">Other</option>
+          </select>
+          <ChevronDown size={15} strokeWidth={2.2} className="report-select-chevron" />
+        </div>
+
+        <input
+          className="report-input"
+          type="text"
+          placeholder="Last Seen Location"
+          value={location}
+          onChange={(e) => setLocation(e.target.value)}
+          required
+        />
+
+        <div className="report-select-wrap">
+          <select
+            className="report-select"
+            value={district}
+            onChange={(e) => setDistrict(e.target.value)}
+            required
+          >
+            <option value="" disabled>District</option>
+            {['Kandy', 'Colombo', 'Gampaha', 'Matara', 'Galle', 'Kurunegala', 'Ratnapura', 'Anuradhapura', 'Trincomalee', 'Jaffna', 'Other'].map(
+              (d) => <option key={d} value={d}>{d}</option>
+            )}
+          </select>
+          <ChevronDown size={15} strokeWidth={2.2} className="report-select-chevron" />
+        </div>
+
+        <input
+          className="report-input"
+          type="tel"
+          placeholder="Contact Number"
+          value={contact}
+          onChange={(e) => setContact(e.target.value)}
+          required
+        />
+
+        <textarea
+          className="report-textarea"
+          placeholder="Description / Note"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={3}
+        />
+
+        {errorMsg && <p className="form-message" role="alert">{errorMsg}</p>}
+
+        <button className="submit-report-btn" type="submit" disabled={saving}>
+          {saving ? (
+            <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+              <Loader2 size={16} className="spinner" /> Saving...
+            </span>
+          ) : 'Save Changes'}
+        </button>
+      </form>
+
+      <BottomNav activeTab="My Reports" onTabChange={onTabChange} />
+    </main>
+  );
+}
+
 // ── My Reports Screen ─────────────────────────────────────────────────────────
+
+type MyReportsView = 'list' | 'detail' | 'edit';
+type MyReportsSection = 'Active' | 'Closed';
 
 type MyReportsScreenProps = { onTabChange: (t: Tab) => void; userId: string | null };
 
 function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
-  const [activeTab, setActiveTab] = useState<Tab>('My Reports');
+  const [navTab, setNavTab] = useState<Tab>('My Reports');
+  const [section, setSection] = useState<MyReportsSection>('Active');
+  const [view, setView] = useState<MyReportsView>('list');
+  const [selectedReport, setSelectedReport] = useState<PetReport | null>(null);
   const [reports, setReports] = useState<PetReport[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -559,6 +1102,7 @@ function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
   const load = useCallback(async () => {
     if (!userId || !supabase) { setReports([]); setLoading(false); return; }
     setLoading(true);
+    setError('');
     try {
       const data = await fetchMyReports(userId);
       setReports(data);
@@ -571,30 +1115,120 @@ function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
 
   useEffect(() => { load(); }, [load]);
 
-  const handleTabChange = (t: Tab) => { setActiveTab(t); onTabChange(t); };
+  const handleTabChange = (t: Tab) => { setNavTab(t); onTabChange(t); };
 
+  // ── Actions ──
   const handleMarkFound = async (id: string) => {
     try {
       await updateReportStatus(id, 'FOUND');
       setReports((prev) => prev.map((r) => r.id === id ? { ...r, status: 'FOUND' } : r));
+      if (selectedReport?.id === id) {
+        setSelectedReport((r) => r ? { ...r, status: 'FOUND' } : r);
+      }
+      // Move to Closed section and back to list after marking found
+      setSection('Closed');
+      setView('list');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update report status.');
+      setError(err instanceof Error ? err.message : 'Failed to update report.');
     }
   };
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Delete this report?')) return;
+    if (!confirm('Are you sure you want to delete this report?')) return;
     try {
       await deleteReport(id);
       setReports((prev) => prev.filter((r) => r.id !== id));
+      setView('list');
+      setSelectedReport(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete report.');
     }
   };
 
+  const handleOpenDetail = (r: PetReport) => {
+    setSelectedReport(r);
+    setView('detail');
+  };
+
+  const handleOpenEdit = (r: PetReport) => {
+    setSelectedReport(r);
+    setView('edit');
+  };
+
+  const handleEditSaved = (updated: PetReport) => {
+    setReports((prev) => prev.map((r) => r.id === updated.id ? updated : r));
+    setSelectedReport(updated);
+    setView('detail');
+  };
+
+  const handleBackToList = () => {
+    setView('list');
+    setSelectedReport(null);
+  };
+
+  const handleBackToDetail = () => {
+    setView('detail');
+  };
+
+  // ── Sub-view: Detail ──
+  if (view === 'detail' && selectedReport) {
+    return (
+      <ReportDetailScreen
+        report={selectedReport}
+        onBack={handleBackToList}
+        onTabChange={handleTabChange}
+        onMarkFound={handleMarkFound}
+        onDelete={handleDelete}
+        onEdit={handleOpenEdit}
+        userId={userId}
+      />
+    );
+  }
+
+  // ── Sub-view: Edit ──
+  if (view === 'edit' && selectedReport) {
+    return (
+      <EditReportScreen
+        report={selectedReport}
+        onBack={handleBackToDetail}
+        onTabChange={handleTabChange}
+        onSaved={handleEditSaved}
+        userId={userId}
+      />
+    );
+  }
+
+  // ── Sub-view: List ──
+  const activeReports = reports.filter((r) => r.status === 'LOST');
+  const closedReports = reports.filter((r) => r.status === 'FOUND');
+  const shown = section === 'Active' ? activeReports : closedReports;
+
+  const PLACEHOLDER = 'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg?auto=compress&cs=tinysrgb&h=200&w=200';
+
   return (
-    <main className="app-shell search-screen">
-      <header className="home-header">My Reports</header>
+    <main className="app-shell myreports-screen">
+      <header className="myreports-header">
+        <button className="back-button myreports-back" onClick={() => handleTabChange('Home')} aria-label="Go home">
+          <ArrowLeft size={21} />
+        </button>
+        <span className="myreports-title">My Reports</span>
+      </header>
+
+      {/* Active / Closed tabs */}
+      <div className="myreports-tabs">
+        <button
+          className={`myreports-tab${section === 'Active' ? ' myreports-tab-active' : ''}`}
+          onClick={() => setSection('Active')}
+        >
+          Active
+        </button>
+        <button
+          className={`myreports-tab${section === 'Closed' ? ' myreports-tab-closed-active' : ''}`}
+          onClick={() => setSection('Closed')}
+        >
+          Closed
+        </button>
+      </div>
 
       {!supabase && (
         <p className="search-empty">Connect Supabase to manage your own reports.</p>
@@ -607,51 +1241,67 @@ function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
       {error && <p className="feed-error">{error}</p>}
 
       {!loading && supabase && userId && (
-        <section className="search-results" aria-label="My reports">
-          {reports.length === 0 ? (
-            <p className="search-empty">You haven&apos;t submitted any reports yet.</p>
+        <section className="myreports-list" aria-label={`${section} reports`}>
+          {shown.length === 0 ? (
+            <div className="myreports-empty">
+              <FileText size={40} strokeWidth={1.4} className="myreports-empty-icon" />
+              <p>
+                {section === 'Active'
+                  ? 'No active reports. Create a lost report to get started.'
+                  : 'No closed reports yet.'}
+              </p>
+            </div>
           ) : (
-            reports.map((r) => (
-              <article className="search-card" key={r.id}>
+            shown.map((r) => (
+              <article
+                key={r.id}
+                className="myreports-card"
+                onClick={() => handleOpenDetail(r)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => e.key === 'Enter' && handleOpenDetail(r)}
+                aria-label={`View details for ${r.name}`}
+              >
                 <img
-                  src={r.image_url ?? 'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg?auto=compress&cs=tinysrgb&h=200&w=200'}
+                  src={r.image_url ?? PLACEHOLDER}
                   alt={`${r.name} the ${r.species}`}
-                  className="search-card-img"
+                  className="myreports-card-img"
                 />
-                <div className="search-card-info">
-                  <strong className="search-card-name">{r.name} / {r.species}</strong>
-                  <span className="search-card-location">
-                    <MapPin size={11} strokeWidth={2.2} /> {r.location}
+                <div className="myreports-card-info">
+                  <strong className="myreports-card-name">{r.name} / {r.species}</strong>
+                  <span className="myreports-card-location">
+                    <MapPin size={11} strokeWidth={2.2} />
+                    {r.district || r.location}
                   </span>
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-end', flexShrink: 0 }}>
-                  <span className={`search-card-badge ${r.status === 'FOUND' ? 'badge-found' : 'badge-lost'}`}>
-                    {r.status}
-                  </span>
-                  {r.status === 'LOST' && (
+                  <div className="myreports-card-actions">
                     <button
-                      className="myreport-action-btn found-btn"
-                      onClick={() => handleMarkFound(r.id)}
-                      title="Mark as Found"
+                      className="myreports-icon-btn"
+                      title="Edit report"
+                      onClick={(e) => { e.stopPropagation(); handleOpenEdit(r); }}
+                      aria-label="Edit report"
                     >
-                      Found!
+                      <Pencil size={14} strokeWidth={2.2} />
                     </button>
-                  )}
-                  <button
-                    className="myreport-action-btn delete-btn"
-                    onClick={() => handleDelete(r.id)}
-                    title="Delete report"
-                  >
-                    <Trash2 size={12} />
-                  </button>
+                    <button
+                      className="myreports-icon-btn myreports-icon-btn-delete"
+                      title="Delete report"
+                      onClick={(e) => { e.stopPropagation(); handleDelete(r.id); }}
+                      aria-label="Delete report"
+                    >
+                      <Trash2 size={14} strokeWidth={2.2} />
+                    </button>
+                  </div>
                 </div>
+                <span className={`search-card-badge ${r.status === 'FOUND' ? 'badge-found' : 'badge-lost'}`}>
+                  {r.status}
+                </span>
               </article>
             ))
           )}
         </section>
       )}
 
-      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
+      <BottomNav activeTab={navTab} onTabChange={handleTabChange} />
     </main>
   );
 }
@@ -660,15 +1310,119 @@ function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
 
 type ProfileScreenProps = {
   onTabChange: (t: Tab) => void;
+  userId: string | null;
   userEmail: string | null;
+  profile: Profile | null;
+  onProfileUpdate: (updated: Profile) => void;
   onLogout: () => void;
+  onGoToLogin: () => void;
 };
 
-function ProfileScreen({ onTabChange, userEmail, onLogout }: ProfileScreenProps) {
+function ProfileScreen({
+  onTabChange,
+  userId,
+  userEmail,
+  profile,
+  onProfileUpdate,
+  onLogout,
+  onGoToLogin,
+}: ProfileScreenProps) {
   const [activeTab, setActiveTab] = useState<Tab>('Profile');
+  const [isEditing, setIsEditing] = useState(false);
+  const [editFullName, setEditFullName] = useState('');
+  const [editPhone, setEditPhone] = useState('');
+  const [editAddress, setEditAddress] = useState('');
+  const [editAvatarFile, setEditAvatarFile] = useState<File | null>(null);
+  const [editAvatarPreview, setEditAvatarPreview] = useState<string | null>(null);
+  const editAvatarRef = useRef<HTMLInputElement>(null);
+  const [saving, setSaving] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<{ type: 'error' | 'success'; text: string } | null>(null);
 
-  const handleTabChange = (t: Tab) => { setActiveTab(t); onTabChange(t); };
+  useEffect(() => {
+    if (profile) {
+      setEditFullName(profile.full_name ?? '');
+      setEditPhone(profile.phone ?? '');
+      setEditAddress(profile.address ?? '');
+      setEditAvatarPreview(profile.avatar_url ?? null);
+    }
+  }, [profile]);
+
+  const handleTabChange = (t: Tab) => {
+    setActiveTab(t);
+    onTabChange(t);
+  };
+
+  const handleStartEdit = () => {
+    setStatusMsg(null);
+    setEditFullName(profile?.full_name ?? '');
+    setEditPhone(profile?.phone ?? '');
+    setEditAddress(profile?.address ?? '');
+    setEditAvatarFile(null);
+    setEditAvatarPreview(profile?.avatar_url ?? null);
+    setIsEditing(true);
+  };
+
+  const handleCancelEdit = () => {
+    setStatusMsg(null);
+    setEditFullName(profile?.full_name ?? '');
+    setEditPhone(profile?.phone ?? '');
+    setEditAddress(profile?.address ?? '');
+    setEditAvatarFile(null);
+    setEditAvatarPreview(profile?.avatar_url ?? null);
+    setIsEditing(false);
+  };
+
+  const handleAvatarChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setEditAvatarFile(file);
+    const reader = new FileReader();
+    reader.onload = () => setEditAvatarPreview(reader.result as string);
+    reader.readAsDataURL(file);
+  };
+
+  const handleSaveProfile = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!userId) return;
+    setStatusMsg(null);
+
+    const nameErr = requiredError('Full Name', editFullName);
+    const phoneErr = editPhone.trim()
+      ? (isValidPhone(editPhone) ? null : 'Please enter a valid phone number (at least 8 digits).')
+      : null;
+    const addressErr = requiredError('Address', editAddress);
+    if (nameErr || phoneErr || addressErr) {
+      setStatusMsg({ type: 'error', text: nameErr ?? phoneErr ?? addressErr ?? '' });
+      return;
+    }
+
+    setSaving(true);
+    try {
+      let avatarUrl = profile?.avatar_url ?? null;
+      if (editAvatarFile) {
+        const uploadedUrl = await uploadAvatar(editAvatarFile, userId);
+        if (uploadedUrl) avatarUrl = uploadedUrl;
+      }
+
+      const updated = await updateProfile(userId, {
+        full_name: editFullName.trim(),
+        phone: editPhone.trim() || null,
+        address: editAddress.trim() || null,
+        avatar_url: avatarUrl,
+      });
+      onProfileUpdate(updated);
+      setIsEditing(false);
+      setStatusMsg({ type: 'success', text: 'Profile updated successfully!' });
+    } catch (err) {
+      setStatusMsg({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to update profile.',
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const handleLogout = async () => {
     setLoggingOut(true);
@@ -677,27 +1431,174 @@ function ProfileScreen({ onTabChange, userEmail, onLogout }: ProfileScreenProps)
   };
 
   return (
-    <main className="app-shell search-screen">
-      <header className="home-header">Profile</header>
-
-      <div className="profile-card">
-        <div className="profile-avatar">
-          <UserRound size={38} strokeWidth={1.6} />
+    <main className="app-shell profile-screen">
+      {!userId ? (
+        <div className="profile-guest-card">
+          <div className="profile-avatar">
+            <UserRound size={36} strokeWidth={1.8} />
+          </div>
+          <strong style={{ fontSize: 15, color: '#0d1110' }}>Guest User</strong>
+          <p style={{ margin: 0, fontSize: 12, color: '#6a7870' }}>
+            Log in to manage your profile and view your reports.
+          </p>
+          <button
+            className="primary-button"
+            style={{ width: '100%', marginTop: 8 }}
+            onClick={onGoToLogin}
+          >
+            Log In / Sign Up
+          </button>
         </div>
-        <div className="profile-info">
-          <p className="profile-email">{userEmail ?? 'Guest'}</p>
-          <p className="profile-sub">{supabase ? 'Supabase connected ✓' : 'Preview mode — Supabase not configured'}</p>
-        </div>
-      </div>
+      ) : (
+        <>
+          {/* Circular Avatar */}
+          <div className="profile-figma-avatar-wrap">
+            <img
+              src={
+                profile?.avatar_url ||
+                'https://images.pexels.com/photos/220453/pexels-photo-220453.jpeg?auto=compress&cs=tinysrgb&h=300&w=300'
+              }
+              alt={profile?.full_name || 'User avatar'}
+              className="profile-figma-avatar"
+            />
+          </div>
 
-      <button
-        className="logout-btn"
-        onClick={handleLogout}
-        disabled={loggingOut}
-      >
-        <LogOut size={16} strokeWidth={2} />
-        {loggingOut ? 'Signing out...' : 'Sign Out'}
-      </button>
+          {/* User Name & Dynamic Address Subtitle */}
+          <h1 className="profile-figma-name">
+            {profile?.full_name?.trim() ? profile.full_name : 'John Doe'}
+          </h1>
+          <p className="profile-figma-location">
+            {profile?.address?.trim() ? profile.address : 'Colombo, Western Province'}
+          </p>
+
+          {statusMsg && (
+            <p
+              className={statusMsg.type === 'success' ? 'profile-success-msg' : 'feed-error'}
+              role="alert"
+            >
+              {statusMsg.text}
+            </p>
+          )}
+
+          {isEditing ? (
+            <form className="profile-form" onSubmit={handleSaveProfile}>
+              {/* Avatar Selector in Edit Mode */}
+              <div
+                className="profile-edit-avatar-wrap"
+                onClick={() => editAvatarRef.current?.click()}
+                title="Change photo"
+              >
+                <img
+                  src={
+                    editAvatarPreview ||
+                    profile?.avatar_url ||
+                    'https://images.pexels.com/photos/220453/pexels-photo-220453.jpeg?auto=compress&cs=tinysrgb&h=300&w=300'
+                  }
+                  alt="Preview"
+                  className="profile-figma-avatar"
+                />
+                <div className="profile-edit-avatar-overlay">
+                  <Camera size={18} />
+                  <span>Change</span>
+                </div>
+              </div>
+              <input
+                ref={editAvatarRef}
+                type="file"
+                accept="image/*"
+                hidden
+                onChange={handleAvatarChange}
+              />
+
+              <Field
+                icon={UserRound}
+                placeholder="Full Name"
+                value={editFullName}
+                onChange={setEditFullName}
+              />
+              <Field
+                icon={Phone}
+                type="tel"
+                placeholder="Phone Number"
+                value={editPhone}
+                onChange={setEditPhone}
+              />
+              <Field
+                icon={MapPin}
+                placeholder="Address (e.g. Colombo, Western Province)"
+                value={editAddress}
+                onChange={setEditAddress}
+              />
+              <div className="profile-btn-row">
+                <button
+                  type="submit"
+                  className="profile-save-btn"
+                  disabled={saving}
+                >
+                  {saving ? (
+                    <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                      <Loader2 size={14} className="spinner" /> Saving...
+                    </span>
+                  ) : (
+                    'Save Changes'
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className="profile-cancel-btn"
+                  onClick={handleCancelEdit}
+                  disabled={saving}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <>
+              {/* Green Edit Profile Pill Button */}
+              <button
+                type="button"
+                className="profile-figma-edit-btn"
+                onClick={handleStartEdit}
+              >
+                Edit Profile
+              </button>
+
+              {/* 3-Row Figma Info Card */}
+              <div className="profile-figma-card">
+                <div className="profile-figma-row">
+                  <Phone size={20} className="profile-figma-icon" strokeWidth={2.4} />
+                  <span className="profile-figma-val">
+                    {profile?.phone?.trim() ? profile.phone : '+94 712710482'}
+                  </span>
+                </div>
+
+                <div className="profile-figma-row">
+                  <Mail size={20} className="profile-figma-icon" strokeWidth={2.4} />
+                  <span className="profile-figma-val">{userEmail ?? 'john@gmail.com'}</span>
+                </div>
+
+                <div className="profile-figma-row">
+                  <MapPin size={20} className="profile-figma-icon" strokeWidth={2.4} />
+                  <span className="profile-figma-val">
+                    {profile?.address?.trim() ? profile.address : 'Colombo'}
+                  </span>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* Sign Out Button */}
+          <button
+            className="logout-btn"
+            onClick={handleLogout}
+            disabled={loggingOut}
+          >
+            <LogOut size={16} strokeWidth={2} />
+            {loggingOut ? 'Signing out...' : 'Sign Out'}
+          </button>
+        </>
+      )}
 
       <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
     </main>
@@ -711,6 +1612,7 @@ function App() {
   const [tab, setTab] = useState<Tab>('Home');
   const [userId, setUserId] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
 
   // Auth form state
   const [showPassword, setShowPassword] = useState(false);
@@ -718,6 +1620,10 @@ function App() {
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
+  const [address, setAddress] = useState('');
+  const [signupAvatarFile, setSignupAvatarFile] = useState<File | null>(null);
+  const [signupAvatarPreview, setSignupAvatarPreview] = useState<string | null>(null);
+  const signupAvatarRef = useRef<HTMLInputElement>(null);
   const [message, setMessage] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -746,10 +1652,30 @@ function App() {
       } else {
         setUserId(null);
         setUserEmail(null);
+        setProfile(null);
       }
     });
     return () => subscription.unsubscribe();
   }, []);
+
+  // Fetch profile whenever userId is authenticated
+  useEffect(() => {
+    if (!userId) {
+      setProfile(null);
+      return;
+    }
+    let cancelled = false;
+    fetchProfile(userId)
+      .then((p) => {
+        if (!cancelled && p) setProfile(p);
+      })
+      .catch((err) => {
+        console.error('Failed to load profile:', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
 
   const goTo = (s: Screen) => {
     setMessage('');
@@ -761,6 +1687,9 @@ function App() {
     setPassword('');
     setFullName('');
     setPhone('');
+    setAddress('');
+    setSignupAvatarFile(null);
+    setSignupAvatarPreview(null);
     setIsSubmitting(false);
     setScreen(s);
   };
@@ -803,16 +1732,55 @@ function App() {
         (password.length < 6 ? 'Password must be at least 6 characters.' : null);
       const nameErr = requiredError('Full Name', fullName);
       const phoneErr = requiredError('Phone Number', phone) ?? (isValidPhone(phone) ? null : 'Please enter a valid phone number (at least 8 digits).');
-      if (emailErr || passErr || nameErr || phoneErr) {
-        setMessage(emailErr ?? passErr ?? nameErr ?? phoneErr ?? '');
+      const addrErr = requiredError('Address', address);
+      if (emailErr || passErr || nameErr || phoneErr || addrErr) {
+        setMessage(emailErr ?? passErr ?? nameErr ?? phoneErr ?? addrErr ?? '');
         return;
       }
-      await signUp(email.trim(), password, { full_name: fullName.trim(), phone: phone.trim() });
-      setMessage('Account created! Check your email to confirm, then log in.');
-      // Clear PII from state but keep email so the user can log in immediately
-      setPassword('');
-      setFullName('');
-      setPhone('');
+      if (signupAvatarFile && signupAvatarFile.size > 10 * 1024 * 1024) {
+        setMessage('Profile photo is too large. Maximum size is 10 MB.');
+        return;
+      }
+
+      const data = await signUp(email.trim(), password, {
+        full_name: fullName.trim(),
+        phone: phone.trim(),
+        address: address.trim(),
+      });
+
+      if (data.session && data.user) {
+        // If an avatar file was provided, upload it and update profile
+        if (signupAvatarFile) {
+          try {
+            const avatarUrl = await uploadAvatar(signupAvatarFile, data.user.id);
+            if (avatarUrl) {
+              await updateProfile(data.user.id, { avatar_url: avatarUrl });
+            }
+          } catch (uploadErr) {
+            console.error('Failed to upload signup avatar:', uploadErr);
+          }
+        }
+
+        setUserId(data.user.id);
+        setUserEmail(data.user.email ?? null);
+        setEmail('');
+        setPassword('');
+        setFullName('');
+        setPhone('');
+        setAddress('');
+        setSignupAvatarFile(null);
+        setSignupAvatarPreview(null);
+        setScreen('home');
+      } else {
+        setMessage('Account created. Please confirm your email, then log in.');
+        // Clear sensitive fields but keep email if login is required
+        setPassword('');
+        setFullName('');
+        setPhone('');
+        setAddress('');
+        setSignupAvatarFile(null);
+        setSignupAvatarPreview(null);
+      }
     } catch (err) {
       setMessage(err instanceof Error ? err.message : 'Sign up failed.');
     } finally {
@@ -845,10 +1813,14 @@ function App() {
     await signOut();
     setUserId(null);
     setUserEmail(null);
+    setProfile(null);
     setEmail('');
     setPassword('');
     setFullName('');
     setPhone('');
+    setAddress('');
+    setSignupAvatarFile(null);
+    setSignupAvatarPreview(null);
     setTab('Home');
     setScreen('start');
   };
@@ -856,9 +1828,19 @@ function App() {
   // ── Render home tab ──────────────────────────────────────────
   if (screen === 'home') {
     if (tab === 'Search') return <SearchScreen onTabChange={handleTabChange} />;
-    if (tab === 'Report') return <ReportScreen onTabChange={handleTabChange} userId={userId} />;
+    if (tab === 'Report') return <ReportScreen onTabChange={handleTabChange} userId={userId} userPhone={profile?.phone} />;
     if (tab === 'My Reports') return <MyReportsScreen onTabChange={handleTabChange} userId={userId} />;
-    if (tab === 'Profile') return <ProfileScreen onTabChange={handleTabChange} userEmail={userEmail} onLogout={handleLogout} />;
+    if (tab === 'Profile') return (
+      <ProfileScreen
+        onTabChange={handleTabChange}
+        userId={userId}
+        userEmail={userEmail}
+        profile={profile}
+        onProfileUpdate={setProfile}
+        onLogout={handleLogout}
+        onGoToLogin={() => goTo('login')}
+      />
+    );
     return <HomeScreen onTabChange={handleTabChange} />;
   }
 
@@ -901,11 +1883,46 @@ function App() {
 
       <form onSubmit={isLogin ? handleLogin : handleSignup} className="auth-form">
         {!isLogin && (
-          <Field icon={UserRound} placeholder="Full Name" value={fullName} onChange={setFullName} />
+          <>
+            <button
+              type="button"
+              className="signup-avatar-picker"
+              onClick={() => signupAvatarRef.current?.click()}
+              aria-label="Add profile photo"
+            >
+              {signupAvatarPreview ? (
+                <img src={signupAvatarPreview} alt="Avatar preview" className="signup-avatar-preview" />
+              ) : (
+                <>
+                  <Camera size={24} strokeWidth={1.8} />
+                  <span className="signup-avatar-label">Add Photo</span>
+                </>
+              )}
+            </button>
+            <input
+              ref={signupAvatarRef}
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  setSignupAvatarFile(file);
+                  const r = new FileReader();
+                  r.onload = () => setSignupAvatarPreview(r.result as string);
+                  r.readAsDataURL(file);
+                }
+              }}
+            />
+            <Field icon={UserRound} placeholder="Full Name" value={fullName} onChange={setFullName} />
+          </>
         )}
         <Field icon={Mail} type="email" placeholder="Email" value={email} onChange={setEmail} />
         {!isLogin && (
-          <Field icon={Phone} type="tel" placeholder="Phone Number" value={phone} onChange={setPhone} />
+          <>
+            <Field icon={Phone} type="tel" placeholder="Phone Number" value={phone} onChange={setPhone} />
+            <Field icon={MapPin} placeholder="Address (e.g. Colombo, Western Province)" value={address} onChange={setAddress} />
+          </>
         )}
         <Field
           icon={LockKeyhole}
