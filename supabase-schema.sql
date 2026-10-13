@@ -40,9 +40,9 @@ create trigger on_auth_user_created
 -- RLS
 alter table public.profiles enable row level security;
 
--- Users can only view their own profile for privacy
-create policy "Users can view own profile"
-  on public.profiles for select using (auth.uid() = id);
+-- Profiles are viewable so users can see pet owners and chat participants
+create policy "Anyone can view profiles"
+  on public.profiles for select using (true);
 
 -- Users can insert their own profile
 create policy "Users can insert own profile"
@@ -158,4 +158,68 @@ create policy "Users can delete own avatar"
     bucket_id = 'avatars'
     and auth.uid()::text = (storage.foldername(name))[1]
   );
+
+-- ── Messages ───────────────────────────────────────────────────
+-- Direct 1-on-1 messaging schema between users regarding pet posts
+
+create table if not exists public.messages (
+  id          uuid default gen_random_uuid() primary key,
+  sender_id   uuid references public.profiles(id) on delete cascade not null,
+  receiver_id uuid references public.profiles(id) on delete cascade not null,
+  post_id     uuid references public.pet_reports(id) on delete set null,
+  content     text not null,
+  created_at  timestamptz default now() not null
+);
+
+-- Ensure foreign key constraints to profiles exist for PostgREST joins:
+-- sender:profiles!sender_id(full_name, avatar_url)
+-- receiver:profiles!receiver_id(full_name, avatar_url)
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'messages_sender_id_profiles_fkey'
+  ) then
+    begin
+      alter table public.messages
+        add constraint messages_sender_id_profiles_fkey
+        foreign key (sender_id) references public.profiles(id) on delete cascade;
+    exception when others then null;
+    end;
+  end if;
+
+  if not exists (
+    select 1 from pg_constraint where conname = 'messages_receiver_id_profiles_fkey'
+  ) then
+    begin
+      alter table public.messages
+        add constraint messages_receiver_id_profiles_fkey
+        foreign key (receiver_id) references public.profiles(id) on delete cascade;
+    exception when others then null;
+    end;
+  end if;
+end $$;
+
+-- Indexes for fast conversation lookup and sorting
+create index if not exists messages_sender_receiver_idx on public.messages (sender_id, receiver_id);
+create index if not exists messages_receiver_sender_idx on public.messages (receiver_id, sender_id);
+create index if not exists messages_post_id_idx         on public.messages (post_id);
+create index if not exists messages_created_at_idx      on public.messages (created_at);
+
+-- RLS
+alter table public.messages enable row level security;
+
+-- Users can view messages they sent or received
+create policy "Users can view their own messages"
+  on public.messages for select
+  using (auth.uid() = sender_id or auth.uid() = receiver_id);
+
+-- Users can insert messages as sender
+create policy "Users can insert messages as sender"
+  on public.messages for insert
+  with check (auth.uid() = sender_id);
+
+-- Enable Supabase Realtime for messages table
+alter publication supabase_realtime add table public.messages;
+
+
 

@@ -21,6 +21,7 @@ import {
   Mail,
   MapPin,
   MessageCircle,
+  MessageSquare,
   PawPrint,
   Pencil,
   Phone,
@@ -30,6 +31,7 @@ import {
   SlidersHorizontal,
   Trash2,
   UserRound,
+  X,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import {
@@ -48,13 +50,26 @@ import {
   deleteReport,
   fetchProfile,
   updateProfile,
+  subscribeToMessages,
 } from '@/lib/api';
 import type { PetReport, NewReport, Profile, ReportFilters } from '@/types/database';
+import { ChatScreen } from './components/ChatScreen';
+import { MessagesInboxScreen } from './components/MessagesInboxScreen';
+import {
+  getOrCreateConversationForPost,
+  getTotalUnreadCount,
+  fetchUserConversations,
+  recordIncomingMessage,
+  playNotificationSound,
+  requestNotificationPermission,
+  triggerSystemNotification,
+  markConversationAsRead,
+} from './lib/messaging';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type Screen = 'splash' | 'start' | 'login' | 'signup' | 'home';
-type Tab = 'Home' | 'Search' | 'Report' | 'My Reports' | 'Profile';
+type Tab = 'Home' | 'Search' | 'Messages' | 'Report' | 'My Reports' | 'Profile';
 
 // ── Validation helpers ────────────────────────────────────────────────────────
 
@@ -71,7 +86,7 @@ function requiredError(field: string, value: string | null | undefined): string 
 function isValidPhone(value: string): boolean {
   const trimmed = value.trim();
   // Allow digits, spaces, hyphens, plus, and parentheses
-  const phoneRegex = /^[0-9\s\-\+\(\)]+$/;
+  const phoneRegex = /^[0-9\s\-+()]+$/;
   return phoneRegex.test(trimmed) && trimmed.replace(/\D/g, '').length >= 8;
 }
 
@@ -168,7 +183,7 @@ function Brand({ compact = false }: { compact?: boolean }) {
   );
 }
 
-type BottomNavProps = { activeTab: Tab; onTabChange: (t: Tab) => void };
+type BottomNavProps = { activeTab: Tab; onTabChange: (t: Tab) => void; unreadCount?: number };
 function BottomNav({ activeTab, onTabChange }: BottomNavProps) {
   const tabs: { label: Tab; icon: typeof Home }[] = [
     { label: 'Home', icon: Home },
@@ -227,7 +242,19 @@ function ReportCard({ report, onClick }: { report: PetReport; onClick?: () => vo
 
 // ── Home Screen ───────────────────────────────────────────────────────────────
 
-function HomeScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
+function HomeScreen({
+  onTabChange,
+  userId,
+  onOpenChat,
+  onOpenInbox,
+  unreadCount = 0,
+}: {
+  onTabChange: (t: Tab) => void;
+  userId?: string | null;
+  onOpenChat?: (report: PetReport) => void;
+  onOpenInbox?: () => void;
+  unreadCount?: number;
+}) {
   const [activeTab, setActiveTab] = useState<Tab>('Home');
   const [reports, setReports] = useState<PetReport[]>([]);
   const [loading, setLoading] = useState(true);
@@ -263,13 +290,35 @@ function HomeScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
         report={selectedReport}
         onBack={() => setSelectedReport(null)}
         onTabChange={handleTabChange}
+        userId={userId}
+        onOpenChat={onOpenChat}
       />
     );
   }
 
   return (
     <main className="app-shell home-screen">
-      <header className="home-header">PAWLO</header>
+      <header className="home-header header-with-actions">
+        <span style={{ width: 34 }} />
+        <span className="header-title-centered">PAWLO</span>
+        <button
+          className="header-icon-btn"
+          onClick={onOpenInbox}
+          aria-label={`Messages inbox${unreadCount > 0 ? `, ${unreadCount} unread` : ''}`}
+          title="Messages inbox"
+        >
+          <MessageCircle size={22} strokeWidth={2.2} />
+          {unreadCount > 0 && (
+            <span
+              className="header-badge header-badge-red"
+              aria-label={`${unreadCount} unread messages`}
+              title={`${unreadCount} unread messages`}
+            >
+              <span className="badge-number">{unreadCount}</span>
+            </span>
+          )}
+        </button>
+      </header>
       {error && <p className="feed-error">{error}</p>}
       {loading ? (
         <Spinner />
@@ -284,20 +333,22 @@ function HomeScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
           ))}
         </section>
       )}
-      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
+      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} unreadCount={unreadCount} />
     </main>
   );
 }
 
 // ── Public Report Detail Screen ───────────────────────────────────────────────
 // View-only. No Edit / Delete / Mark-as-Found.
-// Call and WhatsApp buttons use the report's contact field.
+// Call, WhatsApp and Message action buttons.
 
 type PublicReportDetailProps = {
   report: PetReport;
   onBack: () => void;
   onTabChange: (t: Tab) => void;
   activeTab?: Tab;
+  userId?: string | null;
+  onOpenChat?: (report: PetReport) => void;
 };
 
 function PublicReportDetailScreen({
@@ -305,6 +356,8 @@ function PublicReportDetailScreen({
   onBack,
   onTabChange,
   activeTab = 'Home',
+  userId,
+  onOpenChat,
 }: PublicReportDetailProps) {
   const isLost = report.status === 'LOST';
   const PLACEHOLDER = 'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg?auto=compress&cs=tinysrgb&h=650&w=940';
@@ -312,6 +365,9 @@ function PublicReportDetailScreen({
   // Normalised number for wa.me and tel: links
   const phoneNorm = normalizePhone(report.contact ?? '');
   const hasContact = !!phoneNorm;
+
+  // Visibility Rule: Show Message button to all users EXCEPT the pet owner who uploaded the post
+  const isOwner = !!(userId && report.user_id && userId === report.user_id);
 
   const handleCall = () => {
     if (!hasContact) return;
@@ -321,6 +377,12 @@ function PublicReportDetailScreen({
   const handleWhatsApp = () => {
     if (!hasContact) return;
     window.open(`https://wa.me/${phoneNorm}`, '_blank', 'noopener,noreferrer');
+  };
+
+  const handleMessage = () => {
+    if (onOpenChat) {
+      onOpenChat(report);
+    }
   };
 
   return (
@@ -382,7 +444,7 @@ function PublicReportDetailScreen({
         )}
       </div>
 
-      {/* Call + WhatsApp action buttons */}
+      {/* Call + WhatsApp + Message action buttons */}
       <div className="pub-detail-actions">
         <button
           className={`pub-detail-btn pub-detail-call${!hasContact ? ' pub-detail-btn-disabled' : ''}`}
@@ -404,6 +466,17 @@ function PublicReportDetailScreen({
           <MessageCircle size={17} strokeWidth={2.3} />
           Whatsapp
         </button>
+        {!isOwner && (
+          <button
+            className="pub-detail-btn pub-detail-message"
+            onClick={handleMessage}
+            aria-label={`Message ${report.name}'s owner`}
+            title="Message the pet owner"
+          >
+            <MessageSquare size={17} strokeWidth={2.3} />
+            Message
+          </button>
+        )}
       </div>
 
       {!hasContact && (
@@ -417,7 +490,17 @@ function PublicReportDetailScreen({
 
 // ── Search Screen ─────────────────────────────────────────────────────────────
 
-function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
+function SearchScreen({
+  onTabChange,
+  userId,
+  onOpenChat,
+  unreadCount = 0,
+}: {
+  onTabChange: (t: Tab) => void;
+  userId?: string | null;
+  onOpenChat?: (report: PetReport) => void;
+  unreadCount?: number;
+}) {
   const [activeTab, setActiveTab] = useState<Tab>('Search');
   const [query, setQuery] = useState('');
   const [speciesFilter, setSpeciesFilter] = useState('All');
@@ -476,6 +559,8 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
         onBack={() => setSelectedReport(null)}
         onTabChange={handleTabChange}
         activeTab="Search"
+        userId={userId}
+        onOpenChat={onOpenChat}
       />
     );
   }
@@ -558,7 +643,7 @@ function SearchScreen({ onTabChange }: { onTabChange: (t: Tab) => void }) {
         )}
       </section>
 
-      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
+      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} unreadCount={unreadCount} />
     </main>
   );
 }
@@ -569,9 +654,10 @@ type ReportScreenProps = {
   onTabChange: (t: Tab) => void;
   userId: string | null;
   userPhone?: string | null;
+  unreadCount?: number;
 };
 
-function ReportScreen({ onTabChange, userId, userPhone }: ReportScreenProps) {
+function ReportScreen({ onTabChange, userId, userPhone, unreadCount = 0 }: ReportScreenProps) {
   const [activeTab, setActiveTab] = useState<Tab>('Report');
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
@@ -591,7 +677,7 @@ function ReportScreen({ onTabChange, userId, userPhone }: ReportScreenProps) {
     if (userPhone && !contact) {
       setContact(userPhone);
     }
-  }, [userPhone]);
+  }, [userPhone, contact]);
 
   const handleTabChange = (t: Tab) => { setActiveTab(t); onTabChange(t); };
 
@@ -767,7 +853,7 @@ function ReportScreen({ onTabChange, userId, userPhone }: ReportScreenProps) {
         </form>
       )}
 
-      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
+      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} unreadCount={unreadCount} />
     </main>
   );
 }
@@ -1088,9 +1174,14 @@ function EditReportScreen({ report, onBack, onTabChange, onSaved, userId }: Edit
 type MyReportsView = 'list' | 'detail' | 'edit';
 type MyReportsSection = 'Active' | 'Closed';
 
-type MyReportsScreenProps = { onTabChange: (t: Tab) => void; userId: string | null };
+type MyReportsScreenProps = {
+  onTabChange: (t: Tab) => void;
+  userId: string | null;
+  onOpenInbox?: () => void;
+  unreadCount?: number;
+};
 
-function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
+function MyReportsScreen({ onTabChange, userId, onOpenInbox, unreadCount = 0 }: MyReportsScreenProps) {
   const [navTab, setNavTab] = useState<Tab>('My Reports');
   const [section, setSection] = useState<MyReportsSection>('Active');
   const [view, setView] = useState<MyReportsView>('list');
@@ -1207,12 +1298,49 @@ function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
 
   return (
     <main className="app-shell myreports-screen">
-      <header className="myreports-header">
+      <header className="myreports-header header-with-actions">
         <button className="back-button myreports-back" onClick={() => handleTabChange('Home')} aria-label="Go home">
           <ArrowLeft size={21} />
         </button>
-        <span className="myreports-title">My Reports</span>
+        <span className="myreports-title header-title-centered">My Reports</span>
+        <button
+          className="header-icon-btn"
+          onClick={onOpenInbox}
+          aria-label={`Messages inbox${unreadCount > 0 ? `, ${unreadCount} unread` : ''}`}
+          title="Messages inbox"
+        >
+          <MessageCircle size={22} strokeWidth={2.2} />
+          {unreadCount > 0 && (
+            <span
+              className="header-badge header-badge-red"
+              aria-label={`${unreadCount} unread messages`}
+              title={`${unreadCount} unread messages`}
+            >
+              <span className="badge-number">{unreadCount}</span>
+            </span>
+          )}
+        </button>
       </header>
+
+      {/* Pet Owner Messages Inbox quick-access banner */}
+      <div
+        className="myreports-inbox-banner"
+        onClick={onOpenInbox}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => e.key === 'Enter' && onOpenInbox?.()}
+      >
+        <div className="inbox-banner-left">
+          <div className="inbox-banner-icon">
+            <MessageSquare size={17} strokeWidth={2.4} />
+          </div>
+          <div>
+            <span className="inbox-banner-text">Messages Inbox</span>
+            <span className="inbox-banner-sub">View inquiries from interested users</span>
+          </div>
+        </div>
+        {unreadCount > 0 && <span className="inbox-banner-badge">{unreadCount} new</span>}
+      </div>
 
       {/* Active / Closed tabs */}
       <div className="myreports-tabs">
@@ -1301,7 +1429,7 @@ function MyReportsScreen({ onTabChange, userId }: MyReportsScreenProps) {
         </section>
       )}
 
-      <BottomNav activeTab={navTab} onTabChange={handleTabChange} />
+      <BottomNav activeTab={navTab} onTabChange={handleTabChange} unreadCount={unreadCount} />
     </main>
   );
 }
@@ -1316,6 +1444,8 @@ type ProfileScreenProps = {
   onProfileUpdate: (updated: Profile) => void;
   onLogout: () => void;
   onGoToLogin: () => void;
+  onOpenInbox?: () => void;
+  unreadCount?: number;
 };
 
 function ProfileScreen({
@@ -1326,6 +1456,8 @@ function ProfileScreen({
   onProfileUpdate,
   onLogout,
   onGoToLogin,
+  onOpenInbox,
+  unreadCount = 0,
 }: ProfileScreenProps) {
   const [activeTab, setActiveTab] = useState<Tab>('Profile');
   const [isEditing, setIsEditing] = useState(false);
@@ -1588,6 +1720,25 @@ function ProfileScreen({
             </>
           )}
 
+          {/* Messages Inbox Button */}
+          <button
+            type="button"
+            className="myreports-inbox-banner"
+            style={{ marginTop: 14, marginBottom: 0, textAlign: 'left' }}
+            onClick={onOpenInbox}
+          >
+            <div className="inbox-banner-left">
+              <div className="inbox-banner-icon">
+                <MessageSquare size={17} strokeWidth={2.4} />
+              </div>
+              <div>
+                <span className="inbox-banner-text">Messages Inbox</span>
+                <span className="inbox-banner-sub">View conversations and inquiries</span>
+              </div>
+            </div>
+            {unreadCount > 0 && <span className="inbox-banner-badge">{unreadCount} new</span>}
+          </button>
+
           {/* Sign Out Button */}
           <button
             className="logout-btn"
@@ -1600,8 +1751,76 @@ function ProfileScreen({
         </>
       )}
 
-      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} />
+      <BottomNav activeTab={activeTab} onTabChange={handleTabChange} unreadCount={unreadCount} />
     </main>
+  );
+}
+
+// ── In-App Push Notification Banner ──────────────────────────────────────────
+
+type IncomingNotification = {
+  senderId: string;
+  senderName: string;
+  senderAvatar: string | null;
+  content: string;
+  unreadCount: number;
+};
+
+function InAppNotificationBanner({
+  notif,
+  onOpen,
+  onClose,
+}: {
+  notif: IncomingNotification;
+  onOpen: (senderId: string) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      onClose();
+    }, 5500);
+    return () => clearTimeout(timer);
+  }, [notif, onClose]);
+
+  return (
+    <aside
+      className="inapp-notification-banner"
+      onClick={() => onOpen(notif.senderId)}
+      role="alert"
+      aria-live="polite"
+      tabIndex={0}
+      onKeyDown={(e) => e.key === 'Enter' && onOpen(notif.senderId)}
+      aria-label={`New message from ${notif.senderName}: ${notif.content}`}
+    >
+      <div className="inapp-notif-avatar-wrap">
+        {notif.senderAvatar ? (
+          <img src={notif.senderAvatar} alt={notif.senderName} className="inapp-notif-avatar-img" />
+        ) : (
+          <UserRound size={22} strokeWidth={2.2} color="#64748b" />
+        )}
+      </div>
+
+      <div className="inapp-notif-content">
+        <div className="inapp-notif-top-row">
+          <span className="inapp-notif-sender">{notif.senderName}</span>
+          <span className="inapp-notif-count-pill">
+            {notif.unreadCount > 1 ? `${notif.unreadCount} new messages` : '1 new message'}
+          </span>
+        </div>
+        <p className="inapp-notif-message">{notif.content}</p>
+      </div>
+
+      <button
+        className="inapp-notif-close"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        aria-label="Dismiss notification"
+      >
+        <X size={16} strokeWidth={2.4} />
+      </button>
+    </aside>
   );
 }
 
@@ -1613,6 +1832,90 @@ function App() {
   const [userId, setUserId] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+  const [incomingNotif, setIncomingNotif] = useState<IncomingNotification | null>(null);
+
+  const refreshUnread = useCallback(() => {
+    setUnreadCount(getTotalUnreadCount(userId));
+  }, [userId]);
+
+  useEffect(() => {
+    refreshUnread();
+  }, [refreshUnread, tab, activeConversationId]);
+
+  useEffect(() => {
+    if (!userId) return;
+
+    // Prompt for standard browser push notification permission
+    requestNotificationPermission();
+
+    // Sync conversations from Supabase DB on startup to compute unread counts
+    fetchUserConversations(userId).then(() => {
+      refreshUnread();
+    });
+
+    const unsubscribe = subscribeToMessages(async (msg) => {
+      if (msg.sender_id === userId || msg.receiver_id === userId) {
+        if (msg.receiver_id === userId) {
+          const isChatOpen =
+            activeConversationId === `conv-${msg.sender_id}` ||
+            activeConversationId === msg.sender_id;
+
+          const { conv, senderUnreadCount } = recordIncomingMessage(msg, userId, isChatOpen);
+          refreshUnread();
+
+          // Only trigger banner, audio chime, and push alert if user is NOT currently inside this chat
+          if (!isChatOpen) {
+            playNotificationSound();
+
+            let senderName = conv.participantName;
+            let senderAvatar = conv.participantAvatar || null;
+
+            if (!senderName || senderName === 'Pet Owner' || senderName === 'User') {
+              try {
+                const p = await fetchProfile(msg.sender_id);
+                if (p?.full_name?.trim()) senderName = p.full_name.trim();
+                if (p?.avatar_url) senderAvatar = p.avatar_url;
+              } catch {
+                // Ignore profile lookup error
+              }
+            }
+
+            setIncomingNotif({
+              senderId: msg.sender_id,
+              senderName: senderName || 'User',
+              senderAvatar: senderAvatar,
+              content: msg.content,
+              unreadCount: senderUnreadCount,
+            });
+
+            triggerSystemNotification(
+              `New message from ${senderName || 'User'}`,
+              `${msg.content} (${senderUnreadCount} new message${senderUnreadCount > 1 ? 's' : ''})`,
+              senderAvatar || undefined
+            );
+          }
+        } else {
+          refreshUnread();
+        }
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [userId, activeConversationId, refreshUnread]);
+
+  const handleOpenChatFromPost = (report: PetReport) => {
+    if (!userId) {
+      setMessage('Please sign in or create an account to message pet owners.');
+      goTo('login');
+      return;
+    }
+    const conv = getOrCreateConversationForPost(report, userId);
+    setActiveConversationId(conv.id);
+  };
 
   // Auth form state
   const [showPassword, setShowPassword] = useState(false);
@@ -1825,23 +2128,108 @@ function App() {
     setScreen('start');
   };
 
+  const handleOpenIncomingNotif = (senderId: string) => {
+    setIncomingNotif(null);
+    if (userId) {
+      markConversationAsRead(`conv-${senderId}`, userId);
+    }
+    setActiveConversationId(`conv-${senderId}`);
+    refreshUnread();
+  };
+
   // ── Render home tab ──────────────────────────────────────────
   if (screen === 'home') {
-    if (tab === 'Search') return <SearchScreen onTabChange={handleTabChange} />;
-    if (tab === 'Report') return <ReportScreen onTabChange={handleTabChange} userId={userId} userPhone={profile?.phone} />;
-    if (tab === 'My Reports') return <MyReportsScreen onTabChange={handleTabChange} userId={userId} />;
-    if (tab === 'Profile') return (
-      <ProfileScreen
-        onTabChange={handleTabChange}
-        userId={userId}
-        userEmail={userEmail}
-        profile={profile}
-        onProfileUpdate={setProfile}
-        onLogout={handleLogout}
-        onGoToLogin={() => goTo('login')}
-      />
+    let screenContent: React.ReactNode = null;
+
+    if (activeConversationId) {
+      screenContent = (
+        <ChatScreen
+          conversationId={activeConversationId}
+          currentUserId={userId}
+          onBack={() => {
+            setActiveConversationId(null);
+            refreshUnread();
+          }}
+        />
+      );
+    } else if (tab === 'Messages') {
+      screenContent = (
+        <MessagesInboxScreen
+          userId={userId}
+          onBack={() => {
+            setTab('Home');
+            refreshUnread();
+          }}
+          onOpenConversation={(convId) => setActiveConversationId(convId)}
+          onGoToHome={() => setTab('Home')}
+          onGoToLogin={() => goTo('login')}
+        />
+      );
+    } else if (tab === 'Search') {
+      screenContent = (
+        <SearchScreen
+          onTabChange={handleTabChange}
+          userId={userId}
+          onOpenChat={handleOpenChatFromPost}
+          unreadCount={unreadCount}
+        />
+      );
+    } else if (tab === 'Report') {
+      screenContent = (
+        <ReportScreen
+          onTabChange={handleTabChange}
+          userId={userId}
+          userPhone={profile?.phone}
+          unreadCount={unreadCount}
+        />
+      );
+    } else if (tab === 'My Reports') {
+      screenContent = (
+        <MyReportsScreen
+          onTabChange={handleTabChange}
+          userId={userId}
+          onOpenInbox={() => setTab('Messages')}
+          unreadCount={unreadCount}
+        />
+      );
+    } else if (tab === 'Profile') {
+      screenContent = (
+        <ProfileScreen
+          onTabChange={handleTabChange}
+          userId={userId}
+          userEmail={userEmail}
+          profile={profile}
+          onProfileUpdate={setProfile}
+          onLogout={handleLogout}
+          onGoToLogin={() => goTo('login')}
+          onOpenInbox={() => setTab('Messages')}
+          unreadCount={unreadCount}
+        />
+      );
+    } else {
+      screenContent = (
+        <HomeScreen
+          onTabChange={handleTabChange}
+          userId={userId}
+          onOpenChat={handleOpenChatFromPost}
+          onOpenInbox={() => setTab('Messages')}
+          unreadCount={unreadCount}
+        />
+      );
+    }
+
+    return (
+      <>
+        {incomingNotif && (
+          <InAppNotificationBanner
+            notif={incomingNotif}
+            onOpen={handleOpenIncomingNotif}
+            onClose={() => setIncomingNotif(null)}
+          />
+        )}
+        {screenContent}
+      </>
     );
-    return <HomeScreen onTabChange={handleTabChange} />;
   }
 
   // ── Splash ───────────────────────────────────────────────────

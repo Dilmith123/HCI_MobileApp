@@ -37,3 +37,31 @@ export type ReportFilters = {
   status?: string;
   district?: string;
 };
+
+// ── Messaging Types ─────────────────────────────────────────────────────────
+
+export type DbMessage = {
+  id: string;
+  sender_id: string;
+  receiver_id: string;
+  post_id: string | null;
+  content: string;
+  created_at: string;
+};
+
+export type ProfileSummary = {
+  full_name: string | null;
+  avatar_url: string | null;
+};
+
+export type DbMessageWithProfiles = DbMessage & {
+  sender?: ProfileSummary | ProfileSummary[] | null;
+  receiver?: ProfileSummary | ProfileSummary[] | null;
+};
+
+export type NewMessage = {
+  sender_id: string;
+  receiver_id: string;
+  post_id?: string | null;
+  content: string;
+};

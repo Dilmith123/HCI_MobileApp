@@ -12,7 +12,13 @@ import type {
   Profile,
   ReportFilters,
   UpdateProfile,
+  DbMessage,
+  DbMessageWithProfiles,
+  ProfileSummary,
+  NewMessage,
 } from '../types/database';
+
+export type { DbMessage, DbMessageWithProfiles, ProfileSummary, NewMessage };
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -78,13 +84,59 @@ export async function resetPassword(email: string): Promise<void> {
  */
 export async function fetchProfile(userId: string): Promise<Profile | null> {
   if (!supabase || !userId) return null;
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('*')
-    .eq('id', userId)
-    .maybeSingle();
-  if (error) throw error;
-  return data;
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (error) {
+      console.warn('fetchProfile query error:', error);
+      return null;
+    }
+
+    // If profile row exists and has a full_name, return it directly
+    if (data && data.full_name?.trim()) {
+      return data;
+    }
+
+    // Check if the target user is the currently authenticated user
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+
+      if (user && user.id === userId) {
+        const metaName =
+          (user.user_metadata?.full_name as string) ||
+          (user.user_metadata?.name as string) ||
+          '';
+        const metaAvatar =
+          (user.user_metadata?.avatar_url as string) ||
+          (user.user_metadata?.picture as string) ||
+          null;
+
+        if (metaName || metaAvatar) {
+          return {
+            id: userId,
+            full_name: metaName || data?.full_name || null,
+            phone: data?.phone || null,
+            address: data?.address || null,
+            avatar_url: metaAvatar || data?.avatar_url || null,
+            created_at: data?.created_at || new Date().toISOString(),
+          };
+        }
+      }
+    } catch {
+      // Ignore auth getUser error
+    }
+
+    return data;
+  } catch (err) {
+    console.warn('fetchProfile exception:', err);
+    return null;
+  }
 }
 
 /**
@@ -384,3 +436,309 @@ export async function uploadAvatar(
 
   return publicUrl;
 }
+
+// ── Messaging (Database) ───────────────────────────────────────────────────────
+
+/**
+ * Validate whether a string is a standard UUID format.
+ */
+function isValidUuid(val?: string | null): boolean {
+  return (
+    typeof val === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val.trim())
+  );
+}
+
+/**
+ * 1. Send Message Integration:
+ * Inserts a new row into the `messages` table containing:
+ * - sender_id: ID of the currently logged-in user (auth.uid())
+ * - receiver_id: ID of the pet owner (or the chat recipient)
+ * - post_id: ID of the related pet post (null if not a valid UUID)
+ * - content: The text message entered by the user
+ */
+export async function sendDbMessage({
+  sender_id,
+  receiver_id,
+  post_id,
+  content,
+}: NewMessage): Promise<DbMessage | null> {
+  if (!supabase) return null;
+  const trimmed = content?.trim();
+  if (!sender_id || !receiver_id || !trimmed) {
+    throw new Error('Sender, recipient, and message content are required.');
+  }
+
+  // Double-check session matches sender_id
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const authUid = session?.user?.id ?? null;
+  if (authUid && authUid !== sender_id) {
+    throw new Error('Session mismatch. You can only send messages as yourself.');
+  }
+
+  const cleanPostId = isValidUuid(post_id) ? post_id : null;
+  const cleanReceiverId = receiver_id.trim();
+
+  const { data, error } = await supabase
+    .from('messages')
+    .insert({
+      sender_id,
+      receiver_id: cleanReceiverId,
+      post_id: cleanPostId,
+      content: trimmed,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error('Error inserting message into Supabase:', error);
+    throw error;
+  }
+  return data;
+}
+
+/**
+ * 2. Fetch Chat Messages (1-on-1 Chat Screen):
+ * Query the `messages` table to fetch all messages exchanged between the active
+ * logged-in user and the selected recipient:
+ * ((sender_id == current_user AND receiver_id == recipient) OR (sender_id == recipient AND receiver_id == current_user))
+ * Ordered by created_at ascending so messages appear in chronological sequence.
+ */
+export async function fetchChatMessages(
+  currentUserId: string,
+  recipientId: string,
+): Promise<DbMessageWithProfiles[]> {
+  if (!supabase || !currentUserId || !recipientId) return [];
+
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select(`
+        *,
+        sender:profiles!sender_id(full_name, avatar_url),
+        receiver:profiles!receiver_id(full_name, avatar_url)
+      `)
+      .or(
+        `and(sender_id.eq.${currentUserId},receiver_id.eq.${recipientId}),and(sender_id.eq.${recipientId},receiver_id.eq.${currentUserId})`
+      )
+      .order('created_at', { ascending: true });
+
+    if (!error && data) {
+      return data as DbMessageWithProfiles[];
+    }
+
+    // Fallback if join relationship is missing from schema cache
+    console.warn('Chat messages join query fallback:', error?.message);
+    const { data: fallbackData } = await supabase
+      .from('messages')
+      .select('*')
+      .or(
+        `and(sender_id.eq.${currentUserId},receiver_id.eq.${recipientId}),and(sender_id.eq.${recipientId},receiver_id.eq.${currentUserId})`
+      )
+      .order('created_at', { ascending: true });
+
+    return (fallbackData as DbMessageWithProfiles[]) ?? [];
+  } catch (err) {
+    console.warn('fetchChatMessages failed:', err);
+    return [];
+  }
+}
+
+export type DbConversationSummary = {
+  partnerId: string;
+  partnerProfile: ProfileSummary | null;
+  latestMessage: DbMessageWithProfiles;
+  unreadCount?: number;
+  postDetails?: {
+    id: string;
+    name: string;
+    species: string;
+    image_url: string | null;
+  } | null;
+};
+
+/**
+ * 3. Fetch Conversations (Messages Inbox View):
+ * Fetches the latest message for each distinct conversation where the current user
+ * is either sender_id or receiver_id.
+ * Joins profiles!sender_id and profiles!receiver_id to retrieve the active chat partner's details.
+ */
+export async function fetchUserConversationsFromDb(
+  currentUserId: string,
+  getLastReadTime?: (partnerId: string) => string | null,
+): Promise<DbConversationSummary[]> {
+  if (!supabase || !currentUserId) return [];
+
+  try {
+    let messages: DbMessageWithProfiles[] | null = null;
+    let usedFallback = false;
+
+    // Join profiles table using sender_id and receiver_id
+    const { data: joinData, error: joinError } = await supabase
+      .from('messages')
+      .select(`
+        *,
+        sender:profiles!sender_id(full_name, avatar_url),
+        receiver:profiles!receiver_id(full_name, avatar_url)
+      `)
+      .or(`sender_id.eq.${currentUserId},receiver_id.eq.${currentUserId}`)
+      .order('created_at', { ascending: false });
+
+    if (!joinError && joinData) {
+      messages = joinData as DbMessageWithProfiles[];
+    } else {
+      usedFallback = true;
+      console.warn('Inbox messages join query fallback:', joinError?.message);
+      const { data: rawData, error: rawError } = await supabase
+        .from('messages')
+        .select('*')
+        .or(`sender_id.eq.${currentUserId},receiver_id.eq.${currentUserId}`)
+        .order('created_at', { ascending: false });
+
+      if (rawError || !rawData) return [];
+      messages = rawData as DbMessageWithProfiles[];
+    }
+
+    if (!messages || messages.length === 0) return [];
+
+    // Group by distinct conversation partner. Since query is ordered by created_at desc,
+    // the first message encountered for each partner is the latest message.
+    const conversationMap = new Map<
+      string,
+      { latestMsg: DbMessageWithProfiles; partnerProfile: ProfileSummary | null }
+    >();
+
+    for (const msg of messages) {
+      const partnerId = msg.sender_id === currentUserId ? msg.receiver_id : msg.sender_id;
+      if (!partnerId) continue;
+
+      if (!conversationMap.has(partnerId)) {
+        // Determine who the logged-in user is talking to:
+        // sender if current user is receiver, or receiver if current user is sender
+        const rawPartner =
+          msg.sender_id === currentUserId ? msg.receiver : msg.sender;
+        const p = Array.isArray(rawPartner) ? rawPartner[0] : rawPartner;
+        const partnerProfile: ProfileSummary | null = p
+          ? {
+              full_name: p.full_name?.trim() || null,
+              avatar_url: p.avatar_url || null,
+            }
+          : null;
+
+        conversationMap.set(partnerId, { latestMsg: msg, partnerProfile });
+      }
+    }
+
+    const partnerIds = Array.from(conversationMap.keys());
+    if (partnerIds.length === 0) return [];
+
+    // Ensure all conversation partners have profiles fetched from public.profiles table if missing
+    const partnersNeedingProfiles = partnerIds.filter((pId) => {
+      const cur = conversationMap.get(pId)?.partnerProfile;
+      return !cur?.full_name || !cur?.avatar_url;
+    });
+
+    if (partnersNeedingProfiles.length > 0) {
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('id, full_name, avatar_url')
+        .in('id', partnersNeedingProfiles);
+
+      profiles?.forEach((p) => {
+        const item = conversationMap.get(p.id);
+        if (item) {
+          item.partnerProfile = {
+            full_name: p.full_name?.trim() || item.partnerProfile?.full_name || null,
+            avatar_url: p.avatar_url || item.partnerProfile?.avatar_url || null,
+          };
+        }
+      });
+    }
+
+    // Fetch related pet post details for distinct post_ids
+    const postIds = Array.from(
+      new Set(
+        Array.from(conversationMap.values())
+          .map((item) => item.latestMsg.post_id)
+          .filter((id): id is string => Boolean(id && isValidUuid(id)))
+      )
+    );
+
+    const postMap = new Map<string, { id: string; name: string; species: string; image_url: string | null }>();
+    if (postIds.length > 0) {
+      const { data: petReports } = await supabase
+        .from('pet_reports')
+        .select('id, name, species, image_url')
+        .in('id', postIds);
+
+      petReports?.forEach((r) => postMap.set(r.id, r));
+    }
+
+    // Count unread incoming messages from each partner to the current user
+    const unreadMap = new Map<string, number>();
+    for (const msg of messages) {
+      if (msg.receiver_id === currentUserId && msg.sender_id) {
+        const pId = msg.sender_id;
+        const lastRead = getLastReadTime ? getLastReadTime(pId) : null;
+        const isUnread = !lastRead || new Date(msg.created_at) > new Date(lastRead);
+        if (isUnread) {
+          unreadMap.set(pId, (unreadMap.get(pId) || 0) + 1);
+        }
+      }
+    }
+
+    const summaries: DbConversationSummary[] = [];
+    for (const [partnerId, { latestMsg, partnerProfile }] of conversationMap.entries()) {
+      summaries.push({
+        partnerId,
+        partnerProfile,
+        latestMessage: latestMsg,
+        unreadCount: unreadMap.get(partnerId) || 0,
+        postDetails: latestMsg.post_id ? postMap.get(latestMsg.post_id) ?? null : null,
+      });
+    }
+
+    return summaries;
+  } catch (err) {
+    console.warn('Error in fetchUserConversationsFromDb:', err);
+    return [];
+  }
+}
+
+/**
+ * 4. Realtime Subscription:
+ * Set up a Supabase Realtime channel subscription listening to `INSERT` events
+ * on the `messages` table so new messages pop up instantly without requiring a screen refresh.
+ */
+export function subscribeToMessages(
+  onInsert: (message: DbMessage) => void,
+): () => void {
+  if (!supabase) return () => {};
+
+  const channelName = `realtime-messages-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const channel = supabase
+    .channel(channelName)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'messages',
+      },
+      (payload) => {
+        if (payload?.new) {
+          onInsert(payload.new as DbMessage);
+        }
+      }
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
+
+
+
